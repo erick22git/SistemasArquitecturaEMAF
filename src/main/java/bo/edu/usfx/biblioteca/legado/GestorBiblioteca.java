@@ -1,5 +1,10 @@
 package bo.edu.usfx.biblioteca.legado;
 
+import bo.edu.usfx.biblioteca.infraestructura.NotificadorPrestamos;
+import bo.edu.usfx.biblioteca.infraestructura.RepositorioPrestamos;
+import bo.edu.usfx.biblioteca.presentacion.ComprobantePrestamo;
+import bo.edu.usfx.biblioteca.presentacion.ReportePrestamosCsv;
+
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -7,29 +12,35 @@ import java.util.List;
 
 /**
  * =====================================================================
- *  CODIGO LEGADO - PUNTO DE PARTIDA DE LA PRACTICA GUIADA
+ *  PASO 1 (SRP) APLICADO
  * =====================================================================
  *
- *  Este es el modulo de prestamos del Sistema de Biblioteca de la USFX
- *  tal como lo dejo el ultimo grupo de pasantes. Funciona. Esta en
- *  produccion. Y cada cambio que pide la Direccion de Bibliotecas
- *  obliga a volver a tocar ESTE archivo.
+ *  GestorBiblioteca ya NO calcula, persiste, notifica y formatea todo
+ *  el mismo. Ahora ORQUESTA: decide la politica de negocio (todavia
+ *  con el if/else -- eso lo resuelve el Paso 2, OCP) y delega cada
+ *  responsabilidad restante a un colaborador que responde ante un
+ *  solo actor:
  *
- *  Tu trabajo NO es reescribirlo desde cero: es refactorizarlo paso a
- *  paso, sin cambiar el comportamiento observable, guiado por SOLID.
+ *    - RepositorioPrestamos   -> Direccion de TI (persistencia)
+ *    - NotificadorPrestamos   -> Comunicacion (avisos)
+ *    - ComprobantePrestamo    -> Kardex (formato del recibo)
+ *    - ReportePrestamosCsv    -> Kardex (formato del reporte)
  *
- *  El nombre ya es la primera pista: "Gestor".
- *  (Tema 3, diapositiva 12: senales de violacion del SRP)
+ *  Nota: todavia construye con "new" su ConexionMySQL y su
+ *  ServidorCorreoSMTP. Esa violacion de DIP se corrige en el Paso 5,
+ *  no en este paso -- por ahora el objetivo es SOLO separar actores.
  * =====================================================================
  */
 public class GestorBiblioteca {
 
-    /* El modulo de alto nivel CONSTRUYE sus propios detalles de bajo nivel. */
     private final ConexionMySQL conexion =
             new ConexionMySQL("jdbc:mysql://10.0.0.7:3306/biblioteca", "root", "usfx2026");
 
     private final ServidorCorreoSMTP correo =
             new ServidorCorreoSMTP("smtp.usfx.bo", 587);
+
+    private final RepositorioPrestamos repositorio = new RepositorioPrestamos(conexion);
+    private final NotificadorPrestamos notificador = new NotificadorPrestamos(correo);
 
     private final List<Prestamo> prestamos = new ArrayList<>();
 
@@ -39,6 +50,7 @@ public class GestorBiblioteca {
     public String registrarPrestamo(Usuario usuario, Libro libro, LocalDate hoy) {
 
         // --- politica de prestamo segun el tipo de usuario ---
+        // (el if/else sigue aca a proposito: se resuelve en el Paso 2, OCP)
         int diasPermitidos;
         int maximoLibros;
         if ("ESTUDIANTE".equals(usuario.getTipo())) {
@@ -69,27 +81,20 @@ public class GestorBiblioteca {
             throw new IllegalStateException("El usuario alcanzo su limite de " + maximoLibros + " ejemplares");
         }
 
-        // --- registro en memoria y en la base ---
+        // --- registro en memoria ---
         LocalDate limite = hoy.plusDays(diasPermitidos);
         Prestamo prestamo = new Prestamo(usuario, libro, hoy, limite);
         prestamos.add(prestamo);
         libro.setDisponible(false);
 
-        conexion.ejecutar("INSERT INTO prestamo (codigo_usuario, signatura, fecha, limite) VALUES ('"
-                + usuario.getCodigo() + "', '" + libro.getSignatura() + "', '" + hoy + "', '" + limite + "')");
-        conexion.ejecutar("UPDATE libro SET disponible = 0 WHERE signatura = '" + libro.getSignatura() + "'");
+        // --- persistencia: delegada (antes: dos conexion.ejecutar() aca mismo) ---
+        repositorio.guardarPrestamo(usuario, libro, hoy, limite);
 
-        // --- notificacion ---
-        correo.enviar(usuario.getCorreo(),
-                "Prestamo registrado",
-                "Estimado/a " + usuario.getNombre() + ", devuelva el ejemplar hasta el " + limite);
+        // --- notificacion: delegada (antes: correo.enviar() aca mismo) ---
+        notificador.notificarPrestamoRegistrado(usuario, limite);
 
-        // --- comprobante impreso ---
-        return "=== BIBLIOTECA USFX ===\n"
-             + "Usuario : " + usuario.getNombre() + " (" + usuario.getCodigo() + ")\n"
-             + "Titulo  : " + libro.getTitulo() + "\n"
-             + "Entrega : " + limite + "\n"
-             + "=======================";
+        // --- comprobante: delegado (antes: el String armado aca mismo) ---
+        return ComprobantePrestamo.imprimir(usuario, libro, limite);
     }
 
     // -----------------------------------------------------------------
@@ -116,7 +121,6 @@ public class GestorBiblioteca {
             multa = diasRetraso * 3.0;
         }
 
-        // tope: la multa nunca supera los 200 Bs
         if (multa > 200.0) {
             multa = 200.0;
         }
@@ -132,40 +136,37 @@ public class GestorBiblioteca {
 
         double multa = calcularMulta(prestamo, hoy);
 
-        conexion.ejecutar("UPDATE prestamo SET devolucion = '" + hoy + "', multa = " + multa
-                + " WHERE signatura = '" + prestamo.getLibro().getSignatura() + "'");
-        conexion.ejecutar("UPDATE libro SET disponible = 1 WHERE signatura = '"
-                + prestamo.getLibro().getSignatura() + "'");
+        // --- persistencia: delegada ---
+        repositorio.registrarDevolucion(prestamo, hoy, multa);
 
+        // --- notificacion: delegada ---
         if (multa > 0) {
-            correo.enviar(prestamo.getUsuario().getCorreo(),
-                    "Multa por retraso",
-                    "Debe cancelar Bs " + multa + " en caja antes de su proximo prestamo.");
+            notificador.notificarMulta(prestamo.getUsuario(), multa);
         }
 
         return "Devolucion registrada. Multa: Bs " + multa;
     }
 
     // -----------------------------------------------------------------
-    // 4. REPORTE MENSUAL (CSV escrito a disco)
+    // 4. REPORTE MENSUAL (CSV)
     // -----------------------------------------------------------------
     public String generarReporteMensual(int mes, int anio) {
-        conexion.consultar("SELECT * FROM prestamo WHERE MONTH(fecha) = " + mes
-                + " AND YEAR(fecha) = " + anio);
+        repositorio.consultarPrestamosDelMes(mes, anio);
 
-        StringBuilder csv = new StringBuilder("codigo;titulo;fecha;limite;multa\n");
+        List<String> filas = new ArrayList<>();
         for (Prestamo p : prestamos) {
             if (p.getFechaPrestamo().getMonthValue() == mes && p.getFechaPrestamo().getYear() == anio) {
-                csv.append(p.getUsuario().getCodigo()).append(';')
-                   .append(p.getLibro().getTitulo()).append(';')
-                   .append(p.getFechaPrestamo()).append(';')
-                   .append(p.getFechaLimite()).append(';')
-                   .append(calcularMulta(p, LocalDate.now())).append('\n');
+                filas.add(p.getUsuario().getCodigo() + ";"
+                        + p.getLibro().getTitulo() + ";"
+                        + p.getFechaPrestamo() + ";"
+                        + p.getFechaLimite() + ";"
+                        + calcularMulta(p, LocalDate.now()));
             }
         }
-        // ademas de calcular, decide el formato Y el destino
         System.out.println("[FileWriter] C:/reportes/biblioteca_" + anio + "_" + mes + ".csv");
-        return csv.toString();
+
+        // --- formato del reporte: delegado ---
+        return ReportePrestamosCsv.generar(filas);
     }
 
     // -----------------------------------------------------------------
@@ -175,9 +176,7 @@ public class GestorBiblioteca {
         int enviados = 0;
         for (Prestamo p : prestamos) {
             if (p.estaActivo() && p.getFechaLimite().minusDays(1).equals(hoy)) {
-                correo.enviar(p.getUsuario().getCorreo(),
-                        "Su prestamo vence manana",
-                        "Recuerde devolver: " + p.getLibro().getTitulo());
+                notificador.notificarRecordatorio(p.getUsuario(), p.getLibro());
                 enviados++;
             }
         }
